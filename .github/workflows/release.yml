@@ -1,6 +1,6 @@
-# Builds the engine for each kind of Mac and attaches it to the GitHub release
-# for the tag; the mod downloads the one it needs on first use. Tag a release
-# as v<version>, matching plugin.json.
+# Builds the engine for each kind of Mac and for Windows and attaches it to
+# the GitHub release for the tag; the mod downloads the one it needs on first
+# use. Tag a release as v<version>, matching plugin.json.
 name: Release
 
 on:
@@ -141,6 +141,138 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Both builds try to create the release; whichever is second finds it there
+          # Every build tries to create the release; all but the first find it there
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "" || true
+          gh release upload "$GITHUB_REF_NAME" "$PACKAGE" --clobber
+
+  # x64 only; Windows 11 on Arm runs it under emulation. Odamex builds zlib and
+  # curl in on Windows, and players need the Visual C++ Redistributable, which
+  # the mod checks for.
+  engine-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      FREEDOOM: https://github.com/freedoom/freedoom/releases/download/v0.13.0/freedoom-0.13.0.zip
+      # The same freedoom2.wad the server runs, or players can't join
+      FREEDOOM2_SHA256: a8772e088847032510d97ba2312406a6998f21cbab44d4ff10696faa9c0ecd4b
+      # The SDL2 and SDL2_mixer that Odamex itself downloads and links on Windows
+      SDL2_VC: https://www.libsdl.org/release/SDL2-devel-2.32.8-VC.zip
+      SDL2_VC_SHA256: a16e5f0e5de87a804e3c240a7d92aca0318fda176b22d95550c6512fc4f18172
+      SDL2_MIXER: SDL2_mixer-2.8.1
+      PACKAGE: intermission-engine-windows-x64.tar.gz
+    steps:
+      # The patch applies only to sources with the line endings as committed
+      - name: Keep line endings
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+
+      - uses: actions/checkout@v5
+
+      - name: Check the tag matches plugin.json
+        run: test "v$(jq -r .version .claude-plugin/plugin.json)" = "$GITHUB_REF_NAME"
+
+      # As on the Macs, Odamex's SDL2_mixer brings codecs that aren't needed,
+      # as optional libraries with licenses of their own. Odamex links the one
+      # it downloads, and the package carries this one, the same version,
+      # in its place.
+      - name: Build SDL2_mixer without codecs
+        run: |
+          curl -fsSL -o sdl2.zip "$SDL2_VC"
+          echo "$SDL2_VC_SHA256  sdl2.zip" | sha256sum -c
+          unzip -q sdl2.zip
+          curl -fsSL "https://github.com/libsdl-org/SDL_mixer/releases/download/release-${SDL2_MIXER#SDL2_mixer-}/$SDL2_MIXER.tar.gz" | tar -xz
+          root=$(cygpath -m "$PWD")
+          cmake -S "$SDL2_MIXER" -B mixer-build -A x64 -DCMAKE_INSTALL_PREFIX="$root/mixer" \
+            -DSDL2_DIR="$root/SDL2-2.32.8/cmake" \
+            -DSDL2MIXER_SAMPLES=OFF -DSDL2MIXER_CMD=OFF -DSDL2MIXER_FLAC=OFF -DSDL2MIXER_GME=OFF \
+            -DSDL2MIXER_MOD=OFF -DSDL2MIXER_MP3=OFF -DSDL2MIXER_MIDI=OFF -DSDL2MIXER_OPUS=OFF \
+            -DSDL2MIXER_VORBIS=OFF -DSDL2MIXER_WAVPACK=OFF
+          cmake --build mixer-build --config Release
+          cmake --install mixer-build --config Release
+
+      - name: Get Odamex with our changes
+        run: |
+          git clone -q https://github.com/odamex/odamex.git odamex
+          git -C odamex checkout -q "$(cat engine/odamex-commit)"
+          git -C odamex submodule update -q --init --recursive --depth 1
+          git -C odamex apply ../engine/odamex.patch
+
+      # Odamex builds its own libraries for RelWithDebInfo and Debug only, so
+      # a Release build would find no protoc. Its cvar documents, refreshed by
+      # running the game after each build, are off here as in its own CI.
+      - name: Build
+        run: |
+          cmake -S odamex -B odamex/build -A x64 \
+            -DBUILD_CLIENT=1 -DBUILD_SERVER=0 -DBUILD_LAUNCHER=0 -DBUILD_TESTS=0 -DODAMEX_NO_GITVER=1 \
+            -DODAMEX_UPDATE_CVARDOCS=0
+          cmake --build odamex/build --config RelWithDebInfo --target odamex odawad_odamex --parallel
+
+      # Odamex copies its own SDL2_mixer and that one's codecs beside the
+      # game, so the package takes just what it needs
+      - name: Package
+        run: |
+          build=odamex/build/client/RelWithDebInfo
+          mkdir -p package/licenses freedoom
+          cp "$build/odamex.exe" "$build/odamex.wad" SDL2-2.32.8/lib/x64/SDL2.dll mixer/bin/SDL2_mixer.dll package/
+          curl -fsSL -o freedoom.zip "$FREEDOOM"
+          unzip -q -j freedoom.zip '*/freedoom2.wad' '*/COPYING.txt' -d freedoom
+          echo "$FREEDOOM2_SHA256  freedoom/freedoom2.wad" | sha256sum -c
+          cp freedoom/freedoom2.wad package/
+
+          # Every license of what the engine contains, built in or bundled
+          cp odamex/LICENSE package/licenses/odamex.txt
+          cp odamex/3RD-PARTY-LICENSES package/licenses/odamex-third-party.txt
+          for license in libpng/LICENSE fltk/COPYING minilzo/COPYING jsoncpp/LICENSE fmt/LICENSE \
+            protobuf/LICENSE portmidi/license.txt cpptrace/LICENSE libadlmidi/LICENSE libadlmidi/LICENSE.GPL-3.txt \
+            curl/COPYING zlib/LICENSE; do
+            cp "odamex/libraries/$license" "package/licenses/$(dirname "$license")-$(basename "$license")"
+          done
+          # No zstd: on Windows cpptrace reads symbols with dbghelp, not libdwarf
+          cp SDL2-2.32.8/LICENSE.txt package/licenses/sdl2.txt
+          cp "$SDL2_MIXER/LICENSE.txt" package/licenses/sdl2-mixer.txt
+          cp freedoom/COPYING.txt package/licenses/freedoom.txt
+          cat > package/SOURCE.txt <<EOF
+          This engine is Odamex at commit $(cat engine/odamex-commit) with the changes in
+          https://github.com/jarrodwatts/intermission/blob/$GITHUB_REF_NAME/engine/odamex.patch applied.
+          Odamex's source, with the libraries it builds in, is at https://github.com/odamex/odamex.
+          SDL is at https://github.com/libsdl-org. The licenses are in licenses/.
+          EOF
+
+      # A packaged engine that never draws a frame would ship looking fine, and
+      # nothing new may be bundled whose license isn't in the package. The
+      # first run of a new executable can wait on a malware scan, hence the
+      # longer limit than on the Macs. Each frame is a file, and only the
+      # newest few may be left behind. Windows plays music through its own
+      # synth, past SDL's dummy driver, so there's none.
+      - name: Check the packaged engine
+        run: |
+          for lib in package/*.dll; do
+            case "$(basename "$lib")" in
+              SDL2.dll | SDL2_mixer.dll) echo "bundled: $(basename "$lib")" ;;
+              *) echo "bundled $(basename "$lib"), whose license isn't in the package"; exit 1 ;;
+            esac
+          done
+          printf '1 0\n' > input.txt
+          here=$(cygpath -w "$PWD")
+          SDL_VIDEODRIVER=dummy SDL_RENDER_DRIVER=software SDL_AUDIODRIVER=dummy \
+            INTERMISSION_FRAMES="$here\\frames\\ci-" INTERMISSION_INPUT="$here\\input.txt" \
+            timeout 30 package/odamex.exe -iwad "$here\\package\\freedoom2.wad" -config "$here\\check.cfg" \
+            -width 320 -height 200 -nomusic +map MAP01 > frames.log 2>&1 || true
+          frames=$(grep -c '^@frame' frames.log || true)
+          left=$(ls frames | wc -l)
+          echo "drew $frames frames, left $left"
+          test "$frames" -gt 10
+          test "$left" -le 8
+
+      - name: Archive
+        run: tar -czf "$PACKAGE" -C package .
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "" || true
           gh release upload "$GITHUB_REF_NAME" "$PACKAGE" --clobber
