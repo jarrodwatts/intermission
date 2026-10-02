@@ -2,9 +2,16 @@ import { expect, mock, test } from 'claude-code/testing'
 
 // Answers everything the mod asks of Claude Code, and counts the pane opening
 // and closing, which is what the person sees. isPlaced(n) says whether the nth
-// open gets room on screen, as it may not in a narrow terminal.
-function stubClaudeCode(on, clock, { isOn = true, isPlaced = (n) => true, isServerUnreachable = false } = {}) {
-  const pane = { opens: 0, closes: 0, engines: [] }
+// open gets room on screen, as it may not in a narrow terminal. env is the
+// process environment, frames what the engine prints once it starts, and
+// missing the ends of paths that don't exist.
+function stubClaudeCode(
+  on,
+  clock,
+  { isOn = true, isPlaced = (n) => true, isServerUnreachable = false, env = {}, frames = [], missing = [] } = {},
+) {
+  const pane = { opens: 0, closes: 0, engines: [], blits: [] }
+  on('env.get', ($, e) => ({ value: env[e.name] }))
   on('store.get', ($, e) => ({ value: e.key === 'isOn' ? isOn : 'TestMarine' }))
   on('store.set', () => ({ value: undefined }))
   on('command.register', () => ({ value: undefined }))
@@ -22,7 +29,7 @@ function stubClaudeCode(on, clock, { isOn = true, isPlaced = (n) => true, isServ
   })
   on('ui.toast', () => ({ value: undefined }))
   on('fs.write', () => ({ value: undefined }))
-  on('fs.exists', () => ({ value: true }))
+  on('fs.exists', ($, e) => ({ value: !missing.some((end) => e.path.endsWith(end)) }))
   // The engine runs for longer than any test. The first one, when the server
   // never answers, draws frames for 11 seconds without reporting connecting.
   on('process.spawn', async function* ($, e) {
@@ -32,9 +39,13 @@ function stubClaudeCode(on, clock, { isOn = true, isPlaced = (n) => true, isServ
       await clock.sleep(11 * 1000)
       yield { stream: 'stdout', text: '@frame /imtest-1 640 360\n' }
     }
+    for (const text of frames) yield { stream: 'stdout', text }
     await clock.sleep(60 * 60 * 1000)
   })
-  on('ui.blit', () => ({ value: {} }))
+  on('ui.blit', ($, e) => {
+    pane.blits.push(e.source)
+    return { value: {} }
+  })
   on('ui.log', () => ({ value: undefined }))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
@@ -204,6 +215,84 @@ test('withdraws the offer when Claude finishes first', async ($, on) => {
   await finishTurn($)
   const withdrawn = await $.ui.mount(BAND)
   expect(await withdrawn.find({ key: 'play' })).toBeUndefined()
+})
+
+test('on Windows, runs odamex.exe and shows frames from files', async ($, on) => {
+  const clock = mock.clock(on)
+  // A person's temporary folder can hold a space, and the engine ends lines in \r\n
+  const temp = 'C:\\Users\\Ada Lovelace\\AppData\\Local\\Temp'
+  const frame = (n) => temp + '\\intermission-frames\\test-' + n + '.rgb'
+  const pane = stubClaudeCode(on, clock, {
+    env: { OS: 'Windows_NT', TEMP: temp, SystemRoot: 'C:\\Windows' },
+    frames: ['@frame ' + frame(0) + ' 640 360\r\n', '@frame ' + frame(1) + ' 640 360\r\n'],
+  })
+  await startSession($)
+
+  await $.turn.start({ turnId: 't1', text: 'refactor auth' })
+  await clock.advance(2000)
+  await clock.advance(100)
+  const argv = pane.engines[0]
+  expect(argv[0]).toMatch(/\\dist\\odamex\.exe$/)
+  expect(argv[argv.indexOf('-config') + 1]).toMatch(/^C:\\Users\\Ada Lovelace\\AppData\\Local\\Temp\\intermission-\w+\.cfg$/)
+  expect(pane.blits).toEqual([{ file: frame(1), format: 'rgb', width: 640, height: 360 }])
+})
+
+const GAME = {
+  plugin: 'intermission',
+  component: 'Pane',
+  requestId: 'intermission',
+  surface: 'terminal',
+  viewport: { columns: 200, rows: 50 },
+  props: {
+    title: 'intermission',
+    isFocused: true,
+    bodyColumns: 100,
+    placement: 'dock',
+    scroll: { offset: 0, bodyRows: 40 },
+    view: {},
+  },
+} as const
+
+test('draws the newest frame in the pane, from shared memory', async ($, on) => {
+  const clock = mock.clock(on)
+  stubClaudeCode(on, clock, { frames: ['@frame /imtest-0 640 360\n', '@frame /imtest-1 640 360\n'] })
+  await startSession($)
+
+  await $.turn.start({ turnId: 't1', text: 'refactor auth' })
+  await clock.advance(2000)
+  await clock.advance(100)
+  const game = await $.ui.mount(GAME)
+  expect((await game.find({ key: 'view' }))?.props.source).toEqual({ shm: '/imtest-1', format: 'rgb', width: 640, height: 360 })
+})
+
+test('on Windows, draws the newest frame in the pane, from a file', async ($, on) => {
+  const clock = mock.clock(on)
+  const frame = 'C:\\Temp\\intermission-frames\\test-1.rgb'
+  stubClaudeCode(on, clock, {
+    env: { OS: 'Windows_NT', TEMP: 'C:\\Temp', SystemRoot: 'C:\\Windows' },
+    frames: ['@frame C:\\Temp\\intermission-frames\\test-0.rgb 640 360\r\n', '@frame ' + frame + ' 640 360\r\n'],
+  })
+  await startSession($)
+
+  await $.turn.start({ turnId: 't1', text: 'refactor auth' })
+  await clock.advance(2000)
+  await clock.advance(100)
+  const game = await $.ui.mount(GAME)
+  expect((await game.find({ key: 'view' }))?.props.source).toEqual({ file: frame, format: 'rgb', width: 640, height: 360 })
+})
+
+test('on Windows without the Visual C++ runtime, stays out', async ($, on) => {
+  const clock = mock.clock(on)
+  const pane = stubClaudeCode(on, clock, {
+    env: { OS: 'Windows_NT', TEMP: 'C:\\Temp', SystemRoot: 'C:\\Windows' },
+    missing: ['vcruntime140_1.dll'],
+  })
+  await startSession($)
+
+  await $.turn.start({ turnId: 't1', text: 'refactor auth' })
+  await clock.advance(5000)
+  expect(pane.opens).toBe(0)
+  expect(pane.engines.length).toBe(0)
 })
 
 test('plays offline when the server never answers', async ($, on) => {

@@ -1,5 +1,5 @@
 diff --git a/client/CMakeLists.txt b/client/CMakeLists.txt
-index 8ecd952..79af2fc 100644
+index 8ecd95230..79af2fca1 100644
 --- a/client/CMakeLists.txt
 +++ b/client/CMakeLists.txt
 @@ -126,8 +126,12 @@ if(APPLE)
@@ -18,10 +18,10 @@ index 8ecd952..79af2fc 100644
  # Client target
 diff --git a/client/sdl/i_frameexport.cpp b/client/sdl/i_frameexport.cpp
 new file mode 100644
-index 0000000..2a7986d
+index 000000000..7419a8ae7
 --- /dev/null
 +++ b/client/sdl/i_frameexport.cpp
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,230 @@
 +// Exports each finished frame for the intermission Claude Code mod.
 +//
 +// When INTERMISSION_FRAMES names a shared-memory prefix (such as "/im"), every
@@ -30,6 +30,10 @@ index 0000000..2a7986d
 +// pixel passes through the mod. Alongside go the moment the client reaches
 +// the server, the player's score whenever it changes, and why, if the server
 +// sends this client away. Without the variable this does nothing.
++//
++// Claude Code reads POSIX shared memory only, so on Windows the prefix starts
++// a file path instead, and each frame is a file the terminal reads and leaves
++// in place.
 +
 +#include "odamex.h"
 +
@@ -37,9 +41,16 @@ index 0000000..2a7986d
 +
 +#include <cstdio>
 +#include <cstdlib>
++
++#ifdef _WIN32
++#include <string>
++#include <vector>
++#include "win32inc.h"
++#else
 +#include <fcntl.h>
 +#include <sys/mman.h>
 +#include <unistd.h>
++#endif
 +
 +#include "cl_main.h"
 +#include "d_player.h"
@@ -87,9 +98,129 @@ index 0000000..2a7986d
 +	fflush(stdout);
 +}
 +
++// Writes the surface's pixels as packed RGB
++static void packFrame(const IWindowSurface* surface, uint8_t* dest)
++{
++	const PixelFormat* format = surface->getPixelFormat();
++	const uint8_t rshift = format->getRShift();
++	const uint8_t gshift = format->getGShift();
++	const uint8_t bshift = format->getBShift();
++
++	for (int y = 0; y < surface->getHeight(); y++)
++	{
++		const uint32_t* row = (const uint32_t*)(surface->getBuffer() + y * surface->getPitch());
++		for (int x = 0; x < surface->getWidth(); x++)
++		{
++			const uint32_t pixel = row[x];
++			*dest++ = pixel >> rshift;
++			*dest++ = pixel >> gshift;
++			*dest++ = pixel >> bshift;
++		}
++	}
++}
++
++#ifdef _WIN32
++
++static const char* FRAME_SUFFIX = ".rgb";
++
++// The terminal leaves files in place, so frames an engine left when it was
++// killed stay until another engine starts and finds them stale
++static const ULONGLONG STALE_AFTER_MS = 60 * 1000;
++
++static std::string frameFolder(const char* prefix)
++{
++	const std::string path(prefix);
++	const size_t cut = path.find_last_of("\\/");
++	return cut == std::string::npos ? std::string(".") : path.substr(0, cut);
++}
++
++static void prepareFrames(const char* prefix)
++{
++	const std::string folder = frameFolder(prefix);
++	CreateDirectoryA(folder.c_str(), NULL);
++
++	FILETIME nowTime;
++	GetSystemTimeAsFileTime(&nowTime);
++	const ULONGLONG now = ((ULONGLONG)nowTime.dwHighDateTime << 32) | nowTime.dwLowDateTime;
++
++	WIN32_FIND_DATAA found;
++	const HANDLE search = FindFirstFileA((folder + "\\*" + FRAME_SUFFIX).c_str(), &found);
++	if (search == INVALID_HANDLE_VALUE)
++		return;
++	do
++	{
++		const FILETIME& written = found.ftLastWriteTime;
++		const ULONGLONG at = ((ULONGLONG)written.dwHighDateTime << 32) | written.dwLowDateTime;
++		// File times count 100-nanosecond steps
++		if (now > at && (now - at) / 10000 > STALE_AFTER_MS)
++			DeleteFileA((folder + "\\" + found.cFileName).c_str());
++	} while (FindNextFileA(search, &found));
++	FindClose(search);
++}
++
++static void removeFrame(const char* name)
++{
++	DeleteFileA(name);
++}
++
++static bool writeFrame(const char* name, const IWindowSurface* surface, size_t size)
++{
++	static std::vector<uint8_t> pixels;
++	pixels.resize(size);
++	packFrame(surface, pixels.data());
++
++	// Temporary, so it stays in memory for the moment it lives
++	const HANDLE file = CreateFileA(name, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
++	                                CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
++	if (file == INVALID_HANDLE_VALUE)
++		return false;
++	DWORD written = 0;
++	const bool isWritten = WriteFile(file, pixels.data(), (DWORD)size, &written, NULL) && written == size;
++	CloseHandle(file);
++	if (!isWritten)
++		DeleteFileA(name);
++	return isWritten;
++}
++
++#else
++
++static const char* FRAME_SUFFIX = "";
++
++static void prepareFrames(const char* prefix) {}
++
++static void removeFrame(const char* name)
++{
++	shm_unlink(name);
++}
++
++static bool writeFrame(const char* name, const IWindowSurface* surface, size_t size)
++{
++	const int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
++	if (fd < 0)
++		return false;
++	if (ftruncate(fd, size) != 0)
++	{
++		close(fd);
++		shm_unlink(name);
++		return false;
++	}
++	uint8_t* out = (uint8_t*)mmap(nullptr, size, PROT_WRITE, MAP_SHARED, fd, 0);
++	close(fd);
++	if (out == MAP_FAILED)
++	{
++		shm_unlink(name);
++		return false;
++	}
++	packFrame(surface, out);
++	munmap(out, size);
++	return true;
++}
++
++#endif
++
 +static void frameName(char* out, size_t size, const char* prefix, unsigned frame)
 +{
-+	snprintf(out, size, "%s%u", prefix, frame);
++	snprintf(out, size, "%s%u%s", prefix, frame, FRAME_SUFFIX);
 +}
 +
 +void I_ExportFrame(const IWindowSurface* surface)
@@ -99,54 +230,22 @@ index 0000000..2a7986d
 +	// Nobody sees frames while the person is handed back to Claude
 +	if (!prefix || !I_IsPlaying() || surface->getBitsPerPixel() != 32)
 +		return;
++	if (frame == 0)
++		prepareFrames(prefix);
 +
-+	char name[32];
++	// Room for a Windows path as well as a shared-memory name
++	char name[1024];
 +	if (frame >= FRAMES_IN_FLIGHT)
 +	{
 +		frameName(name, sizeof(name), prefix, frame - FRAMES_IN_FLIGHT);
-+		shm_unlink(name);
++		removeFrame(name);
 +	}
 +	frameName(name, sizeof(name), prefix, frame++);
 +
 +	const int width = surface->getWidth();
 +	const int height = surface->getHeight();
-+	const size_t size = (size_t)width * height * 3;
-+
-+	const int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
-+	if (fd < 0)
++	if (!writeFrame(name, surface, (size_t)width * height * 3))
 +		return;
-+	if (ftruncate(fd, size) != 0)
-+	{
-+		close(fd);
-+		shm_unlink(name);
-+		return;
-+	}
-+	uint8_t* out = (uint8_t*)mmap(nullptr, size, PROT_WRITE, MAP_SHARED, fd, 0);
-+	close(fd);
-+	if (out == MAP_FAILED)
-+	{
-+		shm_unlink(name);
-+		return;
-+	}
-+
-+	const PixelFormat* format = surface->getPixelFormat();
-+	const uint8_t rshift = format->getRShift();
-+	const uint8_t gshift = format->getGShift();
-+	const uint8_t bshift = format->getBShift();
-+
-+	uint8_t* dest = out;
-+	for (int y = 0; y < height; y++)
-+	{
-+		const uint32_t* row = (const uint32_t*)(surface->getBuffer() + y * surface->getPitch());
-+		for (int x = 0; x < width; x++)
-+		{
-+			const uint32_t pixel = row[x];
-+			*dest++ = pixel >> rshift;
-+			*dest++ = pixel >> gshift;
-+			*dest++ = pixel >> bshift;
-+		}
-+	}
-+	munmap(out, size);
 +
 +	printf("@frame %s %d %d\n", name, width, height);
 +	reportConnected();
@@ -155,7 +254,7 @@ index 0000000..2a7986d
 +}
 diff --git a/client/sdl/i_frameexport.h b/client/sdl/i_frameexport.h
 new file mode 100644
-index 0000000..5547af1
+index 000000000..5547af190
 --- /dev/null
 +++ b/client/sdl/i_frameexport.h
 @@ -0,0 +1,8 @@
@@ -168,7 +267,7 @@ index 0000000..5547af1
 +// Tells the mod why the server sent this client away, such as being full
 +void I_ReportDisconnect(const char* reason);
 diff --git a/client/sdl/i_input.cpp b/client/sdl/i_input.cpp
-index ec42dca..d805509 100644
+index ec42dcae5..d8055099b 100644
 --- a/client/sdl/i_input.cpp
 +++ b/client/sdl/i_input.cpp
 @@ -35,6 +35,7 @@
@@ -190,10 +289,10 @@ index ec42dca..d805509 100644
  	event_t ev;
 diff --git a/client/sdl/i_inputfile.cpp b/client/sdl/i_inputfile.cpp
 new file mode 100644
-index 0000000..0cf3915
+index 000000000..70083ddc9
 --- /dev/null
 +++ b/client/sdl/i_inputfile.cpp
-@@ -0,0 +1,245 @@
+@@ -0,0 +1,358 @@
 +// Reads input from the intermission Claude Code mod.
 +//
 +// A terminal reports key presses but never releases, so the mod works out
@@ -216,7 +315,9 @@ index 0000000..0cf3915
 +// distance it travelled becomes mouse motion before it is put back. That needs
 +// no window and no permission. Esc or Command releases it, so leaving the game
 +// or switching apps never drags a locked cursor along. While locked the cursor
-+// is hidden; macOS shows it again if this process dies.
++// is hidden; macOS shows it again if this process dies. On Windows, Esc, Alt
++// or the Windows key releases it, and it stays in sight, since a process
++// without a window can't hide it over other apps' windows.
 +
 +#include "odamex.h"
 +
@@ -226,7 +327,13 @@ index 0000000..0cf3915
 +#include <cstdlib>
 +#include <cstring>
 +#include <set>
++
++#ifdef _WIN32
++#include "win32inc.h"
++#include <tlhelp32.h>
++#else
 +#include <unistd.h>
++#endif
 +
 +#include "c_cvars.h"
 +#include "c_dispatch.h"
@@ -330,11 +437,120 @@ index 0000000..0cf3915
 +		postEvent(event_t(ev_mouse, 0, motion, 0));
 +}
 +
++#elif defined(_WIN32)
++
++#include <cmath>
++
++static const double MOUSE_PER_PIXEL = 3.0;
++
++static bool isLocked = false;
++static POINT lockedAt;
++
++static void lockMouse()
++{
++	if (isLocked || !GetCursorPos(&lockedAt))
++		return;
++	isLocked = true;
++}
++
++static void releaseMouse()
++{
++	isLocked = false;
++}
++
++static bool isHeld(int key)
++{
++	return (GetAsyncKeyState(key) & 0x8000) != 0;
++}
++
++static void postLockedMotion()
++{
++	if (!isLocked)
++		return;
++	// Alt-Tab and the Windows key switch apps, as Command does on macOS
++	if (isHeld(VK_ESCAPE) || isHeld(VK_MENU) || isHeld(VK_LWIN) || isHeld(VK_RWIN))
++	{
++		releaseMouse();
++		return;
++	}
++	POINT point;
++	if (!GetCursorPos(&point) || (point.x == lockedAt.x && point.y == lockedAt.y))
++		return;
++	SetCursorPos(lockedAt.x, lockedAt.y);
++	const int motion = (int)lround((point.x - lockedAt.x) * MOUSE_PER_PIXEL);
++	if (motion)
++		postEvent(event_t(ev_mouse, 0, motion, 0));
++}
++
 +#else
 +
 +static void lockMouse() {}
 +static void releaseMouse() {}
 +static void postLockedMotion() {}
++
++#endif
++
++// Claude Code stops the engine when it no longer needs it, but not if it dies
++// first, say with its terminal tab; then this process should quit rather than
++// play on unseen.
++#ifdef _WIN32
++
++// Windows hands an orphan to no new parent, so this waits on the parent's
++// handle instead. A process with the parent's id that started after this one
++// was given the id once the parent was gone.
++static HANDLE openParent(bool* isGone)
++{
++	*isGone = false;
++	const DWORD self = GetCurrentProcessId();
++	DWORD parentId = 0;
++	const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
++	if (snapshot == INVALID_HANDLE_VALUE)
++		return NULL;
++	PROCESSENTRY32 entry;
++	entry.dwSize = sizeof(entry);
++	for (BOOL isFound = Process32First(snapshot, &entry); isFound; isFound = Process32Next(snapshot, &entry))
++	{
++		if (entry.th32ProcessID == self)
++		{
++			parentId = entry.th32ParentProcessID;
++			break;
++		}
++	}
++	CloseHandle(snapshot);
++
++	const HANDLE parent = parentId ? OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentId) : NULL;
++	if (!parent)
++	{
++		*isGone = parentId != 0 && GetLastError() == ERROR_INVALID_PARAMETER;
++		return NULL;
++	}
++	FILETIME parentStart, selfStart, unused;
++	if (GetProcessTimes(parent, &parentStart, &unused, &unused, &unused) &&
++	    GetProcessTimes(GetCurrentProcess(), &selfStart, &unused, &unused, &unused) &&
++	    CompareFileTime(&parentStart, &selfStart) > 0)
++	{
++		CloseHandle(parent);
++		*isGone = true;
++		return NULL;
++	}
++	return parent;
++}
++
++static bool isParentGone()
++{
++	static bool isGone = false;
++	static const HANDLE parent = openParent(&isGone);
++	return isGone || (parent && WaitForSingleObject(parent, 0) == WAIT_OBJECT_0);
++}
++
++#else
++
++// The parent is replaced when it dies
++static bool isParentGone()
++{
++	static const pid_t claudeCode = getppid();
++	return getppid() != claudeCode || getppid() == 1;
++}
 +
 +#endif
 +
@@ -388,16 +604,12 @@ index 0000000..0cf3915
 +void I_ReadInputFile()
 +{
 +	static const char* path = getenv("INTERMISSION_INPUT");
-+	static const pid_t claudeCode = getppid();
 +	static std::set<int> held;
 +	static long clicks = 0;
 +	if (!path)
 +		return;
 +
-+	// Claude Code stops the engine when it no longer needs it, but not if it
-+	// dies first, say with its terminal tab; then this process is handed to
-+	// another parent and should quit rather than play on unseen.
-+	if (getppid() != claudeCode || getppid() == 1)
++	if (isParentGone())
 +		exit(0);
 +
 +	postLockedMotion();
@@ -441,7 +653,7 @@ index 0000000..0cf3915
 +}
 diff --git a/client/sdl/i_inputfile.h b/client/sdl/i_inputfile.h
 new file mode 100644
-index 0000000..d6113f9
+index 000000000..d6113f910
 --- /dev/null
 +++ b/client/sdl/i_inputfile.h
 @@ -0,0 +1,6 @@
@@ -452,7 +664,7 @@ index 0000000..d6113f9
 +// False while the mod has handed the person back to Claude
 +bool I_IsPlaying();
 diff --git a/client/sdl/i_video_sdl20.cpp b/client/sdl/i_video_sdl20.cpp
-index ee3c799..d702cdc 100644
+index ee3c79959..d702cdc81 100644
 --- a/client/sdl/i_video_sdl20.cpp
 +++ b/client/sdl/i_video_sdl20.cpp
 @@ -35,6 +35,7 @@
@@ -473,7 +685,7 @@ index ee3c799..d702cdc 100644
  
  	SDL_RenderPresent(mSDLRenderer);
 diff --git a/client/src/cl_parse.cpp b/client/src/cl_parse.cpp
-index c4634e0..5d5d2b2 100644
+index c4634e0a2..5d5d2b289 100644
 --- a/client/src/cl_parse.cpp
 +++ b/client/src/cl_parse.cpp
 @@ -66,6 +66,7 @@
