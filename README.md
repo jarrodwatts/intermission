@@ -7,6 +7,8 @@ A Claude Code plugin that drops you into Doom deathmatch while Claude works, and
 
 ![intermission in action](intermission-preview.png)
 
+![intermission on Windows, in Rio](intermission-windows.png)
+
 When Claude has been working for two seconds, a pane opens beside the
 transcript and you drop into a free-for-all on a shared server with everyone
 else who is waiting on Claude. When Claude finishes there's a three-second
