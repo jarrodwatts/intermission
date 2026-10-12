@@ -23,6 +23,12 @@ const NAME_ENDS = ['Dev', 'Coder', 'Hacker', 'Intern', 'Marine', 'Imp']
 let isOn = false
 let name = null
 
+// Set at session start. Windows has no uname, no rm and no POSIX shared
+// memory, so it runs the built-in tools by path and gets frames as files.
+let isWindows = false
+let tempDir = '/tmp'
+let system32 = null
+
 // Where play stands:
 //   idle      not playing, whether or not Claude is working
 //   waiting   Claude is working; dropping in once the delay passes
@@ -69,7 +75,7 @@ async function dropIn($) {
   if (phase !== 'waiting') return
   timer = null
   const surfaces = await $.session.surfaces()
-  if (!surfaces.includes('terminal') || !(await $.fs.exists(enginePath($.plugin.root)))) {
+  if (!surfaces.includes('terminal') || !(await $.fs.exists(enginePath($.plugin.root))) || (await lacksRuntime($))) {
     phase = 'idle'
     return
   }
@@ -174,7 +180,41 @@ async function needsYou($) {
 }
 
 function enginePath(root) {
-  return root + '/dist/odamex.app/Contents/MacOS/odamex'
+  return isWindows ? root + '\\dist\\odamex.exe' : root + '/dist/odamex.app/Contents/MacOS/odamex'
+}
+
+// A file in the temporary directory, for the engine's settings and input
+function tempPath(file) {
+  return tempDir + (isWindows ? '\\' : '/') + file
+}
+
+// The release asset's platform, as release.yml names it
+async function enginePlatform($) {
+  // Windows 11 on Arm runs the x64 build under emulation
+  if (isWindows) return 'windows-x64'
+  const [system, arch] = (await $.process.run(['uname', '-sm'])).stdout.trim().split(' ')
+  if (system !== 'Darwin') throw new Error('it runs on macOS and Windows for now')
+  return 'macos-' + arch
+}
+
+// With no shell to run them through, Windows gets its built-in tools by path,
+// so a curl or tar from Git or another package manager never stands in
+function tool(name) {
+  return isWindows ? system32 + name + '.exe' : name
+}
+
+async function removeFile($, path) {
+  await $.process.run(isWindows ? [tool('cmd'), '/d', '/c', 'del', '/f', '/q', path] : ['rm', '-f', path])
+}
+
+// odamex.exe needs the Visual C++ runtime, which Windows doesn't come with;
+// started without it, Windows stops it with an error dialog
+const RUNTIME_NEEDED =
+  'The game needs the Microsoft Visual C++ Redistributable: winget install Microsoft.VCRedist.2015+.x64'
+
+async function lacksRuntime($) {
+  if (!isWindows) return false
+  return !(await $.fs.exists(system32 + 'vcruntime140_1.dll')) || !(await $.fs.exists(system32 + 'msvcp140_1.dll'))
 }
 
 // Each plugin version downloads the engine built for it, once
@@ -187,27 +227,39 @@ function ensureEngine($) {
 
 async function downloadEngine($) {
   const root = $.plugin.root
-  if (await $.fs.exists(enginePath(root))) return
   const showStatus = (text) => {
     downloadStatus = text
     $.ui.invalidate('ui.render')
   }
+  if (await $.fs.exists(enginePath(root))) {
+    if (await lacksRuntime($)) showStatus(RUNTIME_NEEDED)
+    return
+  }
   try {
-    const [system, arch] = (await $.process.run(['uname', '-sm'])).stdout.trim().split(' ')
-    if (system !== 'Darwin') throw new Error('it runs on macOS for now')
+    const platform = await enginePlatform($)
     const { version } = JSON.parse(await $.fs.read(root + '/.claude-plugin/plugin.json'))
-    const archive = root + '/engine.tar.gz'
+    const dist = root + (isWindows ? '\\dist' : '/dist')
+    const archive = dist + (isWindows ? '\\engine.tar.gz' : '/engine.tar.gz')
     showStatus('Downloading the game, about 40 MB…')
+    // --create-dirs makes dist, with no mkdir to call on Windows
     const fetched = await $.process.run(
-      ['curl', '-fsSL', '--retry', '2', '-o', archive, RELEASES + '/v' + version + '/intermission-engine-macos-' + arch + '.tar.gz'],
+      [
+        tool('curl'),
+        '-fsSL',
+        '--retry',
+        '2',
+        '--create-dirs',
+        '-o',
+        archive,
+        RELEASES + '/v' + version + '/intermission-engine-' + platform + '.tar.gz',
+      ],
       { timeoutMs: 10 * 60 * 1000 },
     )
     if (fetched.exitCode !== 0) throw new Error(fetched.stderr.trim() || 'the download failed')
-    await $.process.run(['mkdir', '-p', root + '/dist'])
-    const unpacked = await $.process.run(['tar', '-xzf', archive, '-C', root + '/dist'])
-    await $.process.run(['rm', '-f', archive])
+    const unpacked = await $.process.run([tool('tar'), '-xzf', archive, '-C', dist])
+    await removeFile($, archive)
     if (unpacked.exitCode !== 0) throw new Error(unpacked.stderr.trim() || 'the download was damaged')
-    showStatus('The game is ready.')
+    showStatus((await lacksRuntime($)) ? RUNTIME_NEEDED : 'The game is ready.')
   } catch (error) {
     showStatus("Couldn't get the game: " + error.message)
   }
@@ -219,7 +271,7 @@ function engineRequest(root, id) {
       enginePath(root),
       '-iwad', root + '/dist/freedoom2.wad',
       // Its own settings, so a person's own Odamex setup is never touched
-      '-config', '/tmp/intermission-' + id + '.cfg',
+      '-config', tempPath('intermission-' + id + '.cfg'),
       '-width', String(WIDTH),
       '-height', String(HEIGHT),
       '+vid_fullscreen', '0',
@@ -233,8 +285,9 @@ function engineRequest(root, id) {
     env: {
       SDL_VIDEODRIVER: 'dummy',
       SDL_RENDER_DRIVER: 'software',
-      // A per-run name keeps two sessions' frames from colliding
-      INTERMISSION_FRAMES: '/im' + id + '-',
+      // A per-run name keeps two sessions' frames from colliding. On Windows
+      // it starts the path of each frame's file, in a folder the engine sweeps
+      INTERMISSION_FRAMES: isWindows ? tempPath('intermission-frames\\' + id + '-') : '/im' + id + '-',
       INTERMISSION_INPUT: inputPath,
     },
   }
@@ -242,7 +295,7 @@ function engineRequest(root, id) {
 
 async function runEngine($) {
   const id = Math.random().toString(36).slice(2, 6)
-  inputPath = '/tmp/intermission-' + id + '.input'
+  inputPath = tempPath('intermission-' + id + '.input')
   await writeInput($)
   score = { kills: 0, deaths: 0 }
   engine = $.process.spawn(engineRequest($.plugin.root, id))
@@ -254,8 +307,8 @@ async function runEngine($) {
   try {
     for await (const { stream, text } of engine) {
       if (stream !== 'stdout') continue
-      // Pieces arrive as written, not as lines
-      const lines = (pending + text).split('\n')
+      // Pieces arrive as written, not as lines, which end in \r\n on Windows
+      const lines = (pending + text).split(/\r?\n/)
       pending = lines.pop()
       for (const line of lines) {
         if (line === '@connected') {
@@ -277,14 +330,15 @@ async function runEngine($) {
           $.ui.invalidate('ui.render')
           continue
         }
-        const match = /^@frame (\S+)/.exec(line)
+        // A Windows frame is a file path, which may hold spaces
+        const match = /^@frame (.+) \d+ \d+$/.exec(line)
         if (!match) continue
         const isFirst = frame === null
         frame = match[1]
         if (isFirst) {
           $.ui.invalidate('ui.render')
         } else {
-          $.ui.blit({ requestId: PANE, key: 'view', source: shmSource(frame) }).catch(() => {})
+          $.ui.blit({ requestId: PANE, key: 'view', source: frameSource(frame) }).catch(() => {})
         }
       }
       // Leaving the loop is what stops the engine
@@ -320,12 +374,22 @@ async function runEngine($) {
   }
 }
 
-function shmSource(name) {
-  return { shm: name, format: 'rgb', width: WIDTH, height: HEIGHT }
+// Claude Code reads POSIX shared memory only, so on Windows each frame is a
+// file the terminal reads instead
+function frameSource(name) {
+  return isWindows
+    ? { file: name, format: 'rgb', width: WIDTH, height: HEIGHT }
+    : { shm: name, format: 'rgb', width: WIDTH, height: HEIGHT }
 }
 
 export function register(on) {
   on('session.start', async ($, e, next) => {
+    // Every Windows process has OS=Windows_NT in its environment
+    isWindows = (await $.env.get('OS')) === 'Windows_NT'
+    if (isWindows) {
+      tempDir = await $.env.get('TEMP')
+      system32 = (await $.env.get('SystemRoot')) + '\\System32\\'
+    }
     isOn = (await $.store.get('isOn')) === true
     name = await $.store.get('name')
     if (!name) {
@@ -467,7 +531,9 @@ export function register(on) {
       })
     }
 
-    if (e.surface !== 'terminal') return Text({ children: ['intermission needs the terminal, in Ghostty or kitty.'] })
+    if (e.surface !== 'terminal') {
+      return Text({ children: ['intermission needs the terminal, in ' + (isWindows ? 'Rio.' : 'Ghostty or kitty.')] })
+    }
     if (!frame) return Text({ children: [isOffline ? 'Starting an offline game…' : 'Joining the game as ' + name + '…'] })
     // Terminal cells are about twice as tall as they are wide
     const columns = Math.min(255, e.props.bodyColumns)
@@ -477,12 +543,16 @@ export function register(on) {
         ? Text({ bold: true, children: ["Claude's done · back in " + countdown] })
         : Text({
             dimColor: true,
-            children: ['Click the game to play and lock the mouse · Esc or ⌘ releases it · WASD or arrows · left click fires · right click runs · space opens'],
+            children: [
+              'Click the game to play and lock the mouse · ' +
+                (isWindows ? 'Esc or Alt' : 'Esc or ⌘') +
+                ' releases it · WASD or arrows · left click fires · right click runs · space opens',
+            ],
           })
     return Box({
       flexDirection: 'column',
       children: [
-        Image({ key: 'view', source: shmSource(frame), columns, rows, alt: 'Doom' }),
+        Image({ key: 'view', source: frameSource(frame), columns, rows, alt: 'Doom' }),
         // Laid over the picture, so clicks land on the game
         Box({
           position: 'absolute',
