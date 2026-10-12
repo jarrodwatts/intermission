@@ -267,10 +267,14 @@ test('draws the newest frame in the pane, from shared memory', async ($, on) => 
 
 test('on Windows, draws the newest frame in the pane, from a file', async ($, on) => {
   const clock = mock.clock(on)
-  const frame = 'C:\\Temp\\intermission-frames\\test-1.rgb'
+  // The test engine checks a file source against the host's own paths, and a drive letter
+  // isn't absolute off Windows. A rooted path is absolute everywhere, and the mod passes the
+  // engine's path through untouched either way.
+  const folder = '/Temp/intermission-frames/'
+  const frame = folder + 'test-1.rgb'
   stubClaudeCode(on, clock, {
     env: { OS: 'Windows_NT', TEMP: 'C:\\Temp', SystemRoot: 'C:\\Windows' },
-    frames: ['@frame C:\\Temp\\intermission-frames\\test-0.rgb 640 360\r\n', '@frame ' + frame + ' 640 360\r\n'],
+    frames: ['@frame ' + folder + 'test-0.rgb 640 360\r\n', '@frame ' + frame + ' 640 360\r\n'],
   })
   await startSession($)
 
