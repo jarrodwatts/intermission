@@ -18,10 +18,10 @@ index 8ecd95230..79af2fca1 100644
  # Client target
 diff --git a/client/sdl/i_frameexport.cpp b/client/sdl/i_frameexport.cpp
 new file mode 100644
-index 000000000..7419a8ae7
+index 000000000..1488c317c
 --- /dev/null
 +++ b/client/sdl/i_frameexport.cpp
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,313 @@
 +// Exports each finished frame for the intermission Claude Code mod.
 +//
 +// When INTERMISSION_FRAMES names a shared-memory prefix (such as "/im"), every
@@ -39,8 +39,11 @@ index 000000000..7419a8ae7
 +
 +#include "i_frameexport.h"
 +
++#include <algorithm>
++#include <chrono>
 +#include <cstdio>
 +#include <cstdlib>
++#include <string>
 +
 +#ifdef _WIN32
 +#include <string>
@@ -218,6 +221,83 @@ index 000000000..7419a8ae7
 +
 +#endif
 +
++// For terminals that can't show pictures: INTERMISSION_TEXT names a width in
++// columns, and each frame goes out on stdout as one "@text" line of
++// truecolor half-block rows, separated by 0x1f, at most 30 times a second.
++// Colors snap to the 6-level cube, so runs of equal cells share one escape
++// sequence, and an unchanged frame is not sent again.
++static void exportText(const IWindowSurface* surface, int columns)
++{
++	static auto last = std::chrono::steady_clock::now() - std::chrono::seconds(1);
++	const auto now = std::chrono::steady_clock::now();
++	if (now - last < std::chrono::milliseconds(33))
++		return;
++	last = now;
++
++	const int width = surface->getWidth();
++	const int height = surface->getHeight();
++	const int pixelRows = (int)((long)columns * height / width) / 2 * 2;
++	if (columns < 1 || pixelRows < 2)
++		return;
++	const PixelFormat* format = surface->getPixelFormat();
++	const uint8_t rshift = format->getRShift();
++	const uint8_t gshift = format->getGShift();
++	const uint8_t bshift = format->getBShift();
++
++	// Average of the source pixels that fall in one output pixel, coarsened
++	auto colorAt = [&](int ox, int oy) -> uint32_t {
++		const int x0 = ox * width / columns, x1 = std::max(x0 + 1, (ox + 1) * width / columns);
++		const int y0 = oy * height / pixelRows, y1 = std::max(y0 + 1, (oy + 1) * height / pixelRows);
++		unsigned r = 0, g = 0, b = 0, n = 0;
++		for (int y = y0; y < y1 && y < height; y++)
++		{
++			const uint32_t* row = (const uint32_t*)(surface->getBuffer() + y * surface->getPitch());
++			for (int x = x0; x < x1 && x < width; x++, n++)
++			{
++				r += (row[x] >> rshift) & 0xFF;
++				g += (row[x] >> gshift) & 0xFF;
++				b += (row[x] >> bshift) & 0xFF;
++			}
++		}
++		if (!n)
++			return 0;
++		auto snap = [](unsigned v) { return ((v * 5 + 127) / 255) * 51; };
++		return (snap(r / n) << 16) | (snap(g / n) << 8) | snap(b / n);
++	};
++
++	std::string out = "@text ";
++	char sgr[64];
++	for (int row = 0; row < pixelRows; row += 2)
++	{
++		if (row)
++			out += '\x1f';
++		uint32_t fg = 0xFFFFFFFF, bg = 0xFFFFFFFF;
++		for (int x = 0; x < columns; x++)
++		{
++			const uint32_t top = colorAt(x, row), bottom = colorAt(x, row + 1);
++			if (top != fg || bottom != bg)
++			{
++				fg = top;
++				bg = bottom;
++				snprintf(sgr, sizeof(sgr), "\x1b[38;2;%u;%u;%u;48;2;%u;%u;%um", (fg >> 16) & 0xFF,
++				         (fg >> 8) & 0xFF, fg & 0xFF, (bg >> 16) & 0xFF, (bg >> 8) & 0xFF, bg & 0xFF);
++				out += sgr;
++			}
++			out += "\xE2\x96\x80"; // upper half block
++		}
++		out += "\x1b[0m";
++	}
++	static std::string previous;
++	if (out != previous)
++	{
++		printf("%s\n", out.c_str());
++		previous.swap(out);
++	}
++	reportConnected();
++	reportScore();
++	fflush(stdout);
++}
++
 +static void frameName(char* out, size_t size, const char* prefix, unsigned frame)
 +{
 +	snprintf(out, size, "%s%u%s", prefix, frame, FRAME_SUFFIX);
@@ -230,6 +310,9 @@ index 000000000..7419a8ae7
 +	// Nobody sees frames while the person is handed back to Claude
 +	if (!prefix || !I_IsPlaying() || surface->getBitsPerPixel() != 32)
 +		return;
++	static const char* text = getenv("INTERMISSION_TEXT");
++	if (text)
++		return exportText(surface, atoi(text));
 +	if (frame == 0)
 +		prepareFrames(prefix);
 +
@@ -252,20 +335,6 @@ index 000000000..7419a8ae7
 +	reportScore();
 +	fflush(stdout);
 +}
-diff --git a/client/sdl/i_frameexport.h b/client/sdl/i_frameexport.h
-new file mode 100644
-index 000000000..5547af190
---- /dev/null
-+++ b/client/sdl/i_frameexport.h
-@@ -0,0 +1,8 @@
-+#pragma once
-+
-+class IWindowSurface;
-+
-+void I_ExportFrame(const IWindowSurface* surface);
-+
-+// Tells the mod why the server sent this client away, such as being full
-+void I_ReportDisconnect(const char* reason);
 diff --git a/client/sdl/i_input.cpp b/client/sdl/i_input.cpp
 index ec42dcae5..d8055099b 100644
 --- a/client/sdl/i_input.cpp
@@ -287,382 +356,6 @@ index ec42dcae5..d8055099b 100644
  	}
  
  	event_t ev;
-diff --git a/client/sdl/i_inputfile.cpp b/client/sdl/i_inputfile.cpp
-new file mode 100644
-index 000000000..70083ddc9
---- /dev/null
-+++ b/client/sdl/i_inputfile.cpp
-@@ -0,0 +1,358 @@
-+// Reads input from the intermission Claude Code mod.
-+//
-+// A terminal reports key presses but never releases, so the mod works out
-+// which keys count as held and writes that state, not a stream of events, to
-+// the file INTERMISSION_INPUT names. The file holds one line:
-+//
-+//   <playing> <clicks> <key> <key> ...
-+//
-+// where playing is 0 while the person is handed back to Claude, clicks counts
-+// the clicks on the game so far, and each key is an Odamex key code held right
-+// now. Each tic the changes are posted as Doom events. Without the variable
-+// this does nothing.
-+//
-+// Between drop-ins the engine stays connected as a silent spectator, so
-+// dropping back in is instant and nobody is left standing in the open. In an
-+// offline game, with no server to spectate on, it pauses instead.
-+//
-+// A terminal can't capture the mouse either, but a native process can hold
-+// the cursor itself: each click locks it where it landed, and every tic the
-+// distance it travelled becomes mouse motion before it is put back. That needs
-+// no window and no permission. Esc or Command releases it, so leaving the game
-+// or switching apps never drags a locked cursor along. While locked the cursor
-+// is hidden; macOS shows it again if this process dies. On Windows, Esc, Alt
-+// or the Windows key releases it, and it stays in sight, since a process
-+// without a window can't hide it over other apps' windows.
-+
-+#include "odamex.h"
-+
-+#include "i_inputfile.h"
-+
-+#include <cstdio>
-+#include <cstdlib>
-+#include <cstring>
-+#include <set>
-+
-+#ifdef _WIN32
-+#include "win32inc.h"
-+#include <tlhelp32.h>
-+#else
-+#include <unistd.h>
-+#endif
-+
-+#include "c_cvars.h"
-+#include "c_dispatch.h"
-+#include "cl_main.h"
-+#include "d_main.h"
-+#include "d_player.h"
-+#include "doomstat.h"
-+
-+EXTERN_CVAR(snd_sfxvolume)
-+EXTERN_CVAR(snd_musicvolume)
-+
-+static bool isPlaying = true;
-+
-+bool I_IsPlaying()
-+{
-+	return isPlaying;
-+}
-+
-+static void postEvent(const event_t& ev)
-+{
-+	D_PostEvent(&ev);
-+}
-+
-+#ifdef __APPLE__
-+
-+#include <ApplicationServices/ApplicationServices.h>
-+#include <cmath>
-+
-+static const double MOUSE_PER_PIXEL = 3.0;
-+static const CGKeyCode KEY_ESCAPE = 53;
-+
-+static bool isLocked = false;
-+static CGPoint lockedAt;
-+
-+static CGPoint cursorPosition()
-+{
-+	CGEventRef event = CGEventCreate(NULL);
-+	const CGPoint point = CGEventGetLocation(event);
-+	CFRelease(event);
-+	return point;
-+}
-+
-+// Undocumented, and the only way a process that isn't the frontmost app can
-+// hide the cursor. If a macOS release drops it, the cursor simply stays shown.
-+typedef int CGSConnectionID;
-+extern "C" CGSConnectionID _CGSDefaultConnection(void);
-+extern "C" CGError CGSSetConnectionProperty(CGSConnectionID, CGSConnectionID, CFStringRef, CFTypeRef);
-+
-+static void prepareCursor()
-+{
-+	static bool isPrepared = false;
-+	if (isPrepared)
-+		return;
-+	// After a warp macOS ignores the mouse for a moment unless told not to
-+	CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
-+	CGEventSourceSetLocalEventsSuppressionInterval(source, 0.0);
-+	CFRelease(source);
-+	const CGSConnectionID connection = _CGSDefaultConnection();
-+	CGSSetConnectionProperty(connection, connection, CFSTR("SetsCursorInBackground"), kCFBooleanTrue);
-+	isPrepared = true;
-+}
-+
-+static void lockMouse()
-+{
-+	if (isLocked)
-+		return;
-+	prepareCursor();
-+	// A warp to a fractional point lands on a whole one, which would read as motion
-+	const CGPoint point = cursorPosition();
-+	lockedAt = CGPointMake(round(point.x), round(point.y));
-+	// macOS counts hides, so hide once per lock and show once per release
-+	CGDisplayHideCursor(kCGDirectMainDisplay);
-+	isLocked = true;
-+}
-+
-+static void releaseMouse()
-+{
-+	if (!isLocked)
-+		return;
-+	CGDisplayShowCursor(kCGDirectMainDisplay);
-+	isLocked = false;
-+}
-+
-+static void postLockedMotion()
-+{
-+	if (!isLocked)
-+		return;
-+	const CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState);
-+	if (CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, KEY_ESCAPE) ||
-+		(flags & kCGEventFlagMaskCommand))
-+	{
-+		releaseMouse();
-+		return;
-+	}
-+	const CGPoint point = cursorPosition();
-+	if (point.x == lockedAt.x && point.y == lockedAt.y)
-+		return;
-+	CGWarpMouseCursorPosition(lockedAt);
-+	const int motion = (int)lround((point.x - lockedAt.x) * MOUSE_PER_PIXEL);
-+	if (motion)
-+		postEvent(event_t(ev_mouse, 0, motion, 0));
-+}
-+
-+#elif defined(_WIN32)
-+
-+#include <cmath>
-+
-+static const double MOUSE_PER_PIXEL = 3.0;
-+
-+static bool isLocked = false;
-+static POINT lockedAt;
-+
-+static void lockMouse()
-+{
-+	if (isLocked || !GetCursorPos(&lockedAt))
-+		return;
-+	isLocked = true;
-+}
-+
-+static void releaseMouse()
-+{
-+	isLocked = false;
-+}
-+
-+static bool isHeld(int key)
-+{
-+	return (GetAsyncKeyState(key) & 0x8000) != 0;
-+}
-+
-+static void postLockedMotion()
-+{
-+	if (!isLocked)
-+		return;
-+	// Alt-Tab and the Windows key switch apps, as Command does on macOS
-+	if (isHeld(VK_ESCAPE) || isHeld(VK_MENU) || isHeld(VK_LWIN) || isHeld(VK_RWIN))
-+	{
-+		releaseMouse();
-+		return;
-+	}
-+	POINT point;
-+	if (!GetCursorPos(&point) || (point.x == lockedAt.x && point.y == lockedAt.y))
-+		return;
-+	SetCursorPos(lockedAt.x, lockedAt.y);
-+	const int motion = (int)lround((point.x - lockedAt.x) * MOUSE_PER_PIXEL);
-+	if (motion)
-+		postEvent(event_t(ev_mouse, 0, motion, 0));
-+}
-+
-+#else
-+
-+static void lockMouse() {}
-+static void releaseMouse() {}
-+static void postLockedMotion() {}
-+
-+#endif
-+
-+// Claude Code stops the engine when it no longer needs it, but not if it dies
-+// first, say with its terminal tab; then this process should quit rather than
-+// play on unseen.
-+#ifdef _WIN32
-+
-+// Windows hands an orphan to no new parent, so this waits on the parent's
-+// handle instead. A process with the parent's id that started after this one
-+// was given the id once the parent was gone.
-+static HANDLE openParent(bool* isGone)
-+{
-+	*isGone = false;
-+	const DWORD self = GetCurrentProcessId();
-+	DWORD parentId = 0;
-+	const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-+	if (snapshot == INVALID_HANDLE_VALUE)
-+		return NULL;
-+	PROCESSENTRY32 entry;
-+	entry.dwSize = sizeof(entry);
-+	for (BOOL isFound = Process32First(snapshot, &entry); isFound; isFound = Process32Next(snapshot, &entry))
-+	{
-+		if (entry.th32ProcessID == self)
-+		{
-+			parentId = entry.th32ParentProcessID;
-+			break;
-+		}
-+	}
-+	CloseHandle(snapshot);
-+
-+	const HANDLE parent = parentId ? OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentId) : NULL;
-+	if (!parent)
-+	{
-+		*isGone = parentId != 0 && GetLastError() == ERROR_INVALID_PARAMETER;
-+		return NULL;
-+	}
-+	FILETIME parentStart, selfStart, unused;
-+	if (GetProcessTimes(parent, &parentStart, &unused, &unused, &unused) &&
-+	    GetProcessTimes(GetCurrentProcess(), &selfStart, &unused, &unused, &unused) &&
-+	    CompareFileTime(&parentStart, &selfStart) > 0)
-+	{
-+		CloseHandle(parent);
-+		*isGone = true;
-+		return NULL;
-+	}
-+	return parent;
-+}
-+
-+static bool isParentGone()
-+{
-+	static bool isGone = false;
-+	static const HANDLE parent = openParent(&isGone);
-+	return isGone || (parent && WaitForSingleObject(parent, 0) == WAIT_OBJECT_0);
-+}
-+
-+#else
-+
-+// The parent is replaced when it dies
-+static bool isParentGone()
-+{
-+	static const pid_t claudeCode = getppid();
-+	return getppid() != claudeCode || getppid() == 1;
-+}
-+
-+#endif
-+
-+static void setPlaying(bool isNowPlaying)
-+{
-+	static float sfxVolume = 0;
-+	static float musicVolume = 0;
-+	if (isNowPlaying == isPlaying)
-+		return;
-+	isPlaying = isNowPlaying;
-+	if (isPlaying)
-+	{
-+		snd_sfxvolume.Set(sfxVolume);
-+		snd_musicvolume.Set(musicVolume);
-+	}
-+	else
-+	{
-+		sfxVolume = snd_sfxvolume.value();
-+		musicVolume = snd_musicvolume.value();
-+		snd_sfxvolume.Set(0.0f);
-+		snd_musicvolume.Set(0.0f);
-+		releaseMouse();
-+	}
-+}
-+
-+// A join, spectate or pause takes effect a moment later, so keep nudging the
-+// game towards what the mod wants, once a second, until it gets there
-+static void followPlaying()
-+{
-+	static int ticsUntilAsking = 0;
-+	if (--ticsUntilAsking > 0)
-+		return;
-+	if (connected)
-+	{
-+		const bool isSpectating = consoleplayer().spectator;
-+		if (isPlaying && isSpectating)
-+			AddCommandString("join");
-+		else if (!isPlaying && !isSpectating)
-+			AddCommandString("spectate");
-+		else
-+			return;
-+	}
-+	// The pause command toggles, so only send it while the state is wrong
-+	else if (gamestate == GS_LEVEL && paused == isPlaying)
-+		AddCommandString("pause");
-+	else
-+		return;
-+	ticsUntilAsking = TICRATE;
-+}
-+
-+void I_ReadInputFile()
-+{
-+	static const char* path = getenv("INTERMISSION_INPUT");
-+	static std::set<int> held;
-+	static long clicks = 0;
-+	if (!path)
-+		return;
-+
-+	if (isParentGone())
-+		exit(0);
-+
-+	postLockedMotion();
-+	followPlaying();
-+
-+	char line[1024];
-+	FILE* file = fopen(path, "r");
-+	const bool isRead = file && fgets(line, sizeof(line), file);
-+	if (file)
-+		fclose(file);
-+
-+	// The mod rewrites the file in place, so a line without its newline is a
-+	// write in progress: keep the last state until the next tic.
-+	if (!isRead || !strchr(line, '\n'))
-+		return;
-+
-+	char* cursor = line;
-+	setPlaying(strtol(cursor, &cursor, 10) != 0);
-+	const long nextClicks = strtol(cursor, &cursor, 10);
-+	std::set<int> next;
-+	for (char* end; ; cursor = end)
-+	{
-+		const long key = strtol(cursor, &end, 10);
-+		if (end == cursor)
-+			break;
-+		next.insert((int)key);
-+	}
-+
-+	// A new input region counts from zero again, so any change is a new click
-+	if (isPlaying && nextClicks != clicks && nextClicks > 0)
-+		lockMouse();
-+	clicks = nextClicks;
-+
-+	for (const int key : held)
-+		if (!next.count(key))
-+			postEvent(event_t(ev_keyup, key));
-+	for (const int key : next)
-+		if (!held.count(key))
-+			postEvent(event_t(ev_keydown, key));
-+	held = next;
-+}
-diff --git a/client/sdl/i_inputfile.h b/client/sdl/i_inputfile.h
-new file mode 100644
-index 000000000..d6113f910
---- /dev/null
-+++ b/client/sdl/i_inputfile.h
-@@ -0,0 +1,6 @@
-+#pragma once
-+
-+void I_ReadInputFile();
-+
-+// False while the mod has handed the person back to Claude
-+bool I_IsPlaying();
 diff --git a/client/sdl/i_video_sdl20.cpp b/client/sdl/i_video_sdl20.cpp
 index ee3c79959..d702cdc81 100644
 --- a/client/sdl/i_video_sdl20.cpp

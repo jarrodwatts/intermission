@@ -26,6 +26,12 @@ let name = null
 // Set at session start. Windows has no uname, no rm and no POSIX shared
 // memory, so it runs the built-in tools by path and gets frames as files.
 let isWindows = false
+let isLinux = false
+// Text mode draws the game as colored half-block characters, for terminals
+// that can't show pictures
+let isText = false
+let textRows = []
+const TEXT_COLUMNS = 100
 let tempDir = '/tmp'
 let system32 = null
 
@@ -180,7 +186,8 @@ async function needsYou($) {
 }
 
 function enginePath(root) {
-  return isWindows ? root + '\\dist\\odamex.exe' : root + '/dist/odamex.app/Contents/MacOS/odamex'
+  if (isWindows) return root + '\\dist\\odamex.exe'
+  return root + (isLinux ? '/dist/odamex' : '/dist/odamex.app/Contents/MacOS/odamex')
 }
 
 // A file in the temporary directory, for the engine's settings and input
@@ -193,7 +200,8 @@ async function enginePlatform($) {
   // Windows 11 on Arm runs the x64 build under emulation
   if (isWindows) return 'windows-x64'
   const [system, arch] = (await $.process.run(['uname', '-sm'])).stdout.trim().split(' ')
-  if (system !== 'Darwin') throw new Error('it runs on macOS and Windows for now')
+  if (system === 'Linux') throw new Error('build the Linux engine into ' + $.plugin.root + '/dist (no prebuilt release)')
+  if (system !== 'Darwin') throw new Error('it runs on macOS, Windows and Linux for now')
   return 'macos-' + arch
 }
 
@@ -272,8 +280,8 @@ function engineRequest(root, id) {
       '-iwad', root + '/dist/freedoom2.wad',
       // Its own settings, so a person's own Odamex setup is never touched
       '-config', tempPath('intermission-' + id + '.cfg'),
-      '-width', String(WIDTH),
-      '-height', String(HEIGHT),
+      '-width', String(isText ? TEXT_COLUMNS * 2 : WIDTH),
+      '-height', String(isText ? Math.round(TEXT_COLUMNS * 1.12) : HEIGHT),
       '+vid_fullscreen', '0',
       '+vid_maxfps', '35',
       // Odamex's macOS music player ignores volume changes, so it played on
@@ -289,6 +297,7 @@ function engineRequest(root, id) {
       // it starts the path of each frame's file, in a folder the engine sweeps
       INTERMISSION_FRAMES: isWindows ? tempPath('intermission-frames\\' + id + '-') : '/im' + id + '-',
       INTERMISSION_INPUT: inputPath,
+      ...(isText ? { INTERMISSION_TEXT: String(TEXT_COLUMNS) } : {}),
     },
   }
 }
@@ -327,6 +336,12 @@ async function runEngine($) {
         const scored = /^@score (\d+) (\d+)/.exec(line)
         if (scored) {
           score = { kills: Number(scored[1]), deaths: Number(scored[2]) }
+          $.ui.invalidate('ui.render')
+          continue
+        }
+        if (line.startsWith('@text ')) {
+          textRows = line.slice(6).split('\x1f')
+          frame = 'text'
           $.ui.invalidate('ui.render')
           continue
         }
@@ -376,6 +391,17 @@ async function runEngine($) {
 
 // Claude Code reads POSIX shared memory only, so on Windows each frame is a
 // file the terminal reads instead
+// A text row is half blocks, each run of them led by a truecolor escape
+// sequence from the engine; hooks may not draw escapes, so they become styled
+// spans
+function textSpans(Text, row) {
+  const spans = []
+  for (const [, r, g, b, r2, g2, b2, blocks] of row.matchAll(/\x1b\[38;2;(\d+);(\d+);(\d+);48;2;(\d+);(\d+);(\d+)m([^\x1b]*)/g)) {
+    spans.push(Text({ color: `rgb(${r},${g},${b})`, backgroundColor: `rgb(${r2},${g2},${b2})`, children: [blocks] }))
+  }
+  return spans
+}
+
 function frameSource(name) {
   return isWindows
     ? { file: name, format: 'rgb', width: WIDTH, height: HEIGHT }
@@ -390,6 +416,10 @@ export function register(on) {
       tempDir = await $.env.get('TEMP')
       system32 = (await $.env.get('SystemRoot')) + '\\System32\\'
     }
+    if (!isWindows) isLinux = (await $.process.run(['uname', '-s'])).stdout.trim() === 'Linux'
+    // Few Linux terminals show pictures, and none do inside tmux without
+    // setup, so Linux draws text unless INTERMISSION_IMAGES=1 says otherwise
+    isText = isLinux && (await $.env.get('INTERMISSION_IMAGES')) !== '1'
     isOn = (await $.store.get('isOn')) === true
     name = await $.store.get('name')
     if (!name) {
@@ -534,25 +564,29 @@ export function register(on) {
     if (e.surface !== 'terminal') {
       return Text({ children: ['intermission needs the terminal, in ' + (isWindows ? 'Rio.' : 'Ghostty or kitty.')] })
     }
-    if (!frame) return Text({ children: [isOffline ? 'Starting an offline game…' : 'Joining the game as ' + name + '…'] })
+    if (!frame) return Box({ flexDirection: 'column', children: [Text({ children: [isOffline ? 'Starting an offline game…' : 'Joining the game as ' + name + '…'] })] })
     // Terminal cells are about twice as tall as they are wide
-    const columns = Math.min(255, e.props.bodyColumns)
-    const rows = Math.max(1, Math.round((columns * HEIGHT) / WIDTH / 2))
+    const columns = isText ? TEXT_COLUMNS : Math.min(255, e.props.bodyColumns)
+    const rows = isText ? textRows.length : Math.max(1, Math.round((columns * HEIGHT) / WIDTH / 2))
     const status =
       phase === 'countdown'
         ? Text({ bold: true, children: ["Claude's done · back in " + countdown] })
         : Text({
             dimColor: true,
             children: [
-              'Click the game to play and lock the mouse · ' +
-                (isWindows ? 'Esc or Alt' : 'Esc or ⌘') +
-                ' releases it · WASD or arrows · left click fires · right click runs · space opens',
+              isLinux
+                ? 'Click the game to play, then move the mouse to turn · Esc stops · WASD or arrows · left click fires · right click runs · space opens'
+                : 'Click the game to play and lock the mouse · ' +
+                  (isWindows ? 'Esc or Alt' : 'Esc or ⌘') +
+                  ' releases it · WASD or arrows · left click fires · right click runs · space opens',
             ],
           })
     return Box({
       flexDirection: 'column',
       children: [
-        Image({ key: 'view', source: frameSource(frame), columns, rows, alt: 'Doom' }),
+        isText
+          ? Box({ flexDirection: 'column', children: textRows.map((row, i) => Text({ key: 'r' + i, wrap: 'truncate', children: textSpans(Text, row) })) })
+          : Image({ key: 'view', source: frameSource(frame), columns, rows, alt: 'Doom' }),
         // Laid over the picture, so clicks land on the game
         Box({
           position: 'absolute',
