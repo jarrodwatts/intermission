@@ -34,7 +34,7 @@ maps, with monsters left in so the server is never empty.
 
    The first time, it downloads the game, about 20 MB.
 
-To turn it off again, run `/intermission off`.
+To play right now, even when Claude is idle, run `/intermission play`; the pane stays until you close it. To turn it off again, run `/intermission off`.
 
 ## Requirements
 
