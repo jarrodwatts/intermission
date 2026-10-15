@@ -34,7 +34,7 @@ maps, with monsters left in so the server is never empty.
 
    The first time, it downloads the game, about 20 MB.
 
-To turn it off again, run `/intermission off`.
+To play right now, even when Claude is idle, run `/intermission play`; the pane stays until you close it. To turn it off again, run `/intermission off`.
 
 ## Requirements
 
@@ -44,6 +44,7 @@ To turn it off again, run `/intermission off`.
 - or Windows 10 or 11 on x64, in [Rio](https://rioterm.com), set up as
   below, with the
   [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist)
+- or Linux on x64, in any terminal with truecolor or 256 colors, tmux included, after building the engine as below
 - Claude Code 2.1.287 or later
 
 ### On Windows
@@ -91,6 +92,18 @@ once, before installing intermission:
 If `/intermission` doesn't appear once it's installed, your Claude Code may
 not load mods yet; add `"CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1"` to the same
 `env-vars` list.
+
+### On Linux
+
+There is no prebuilt Linux engine yet, so build it once with
+[`engine/build-linux.sh`](engine/build-linux.sh) (it needs cmake, ninja, SDL2
+and SDL2_mixer development packages). Most Linux terminals can't show pictures,
+so the game is drawn as colored half-block characters, about 100 columns wide.
+Set `INTERMISSION_IMAGES=1` to send pictures instead, in kitty or Ghostty.
+
+Terminals can't lock the mouse, so the pointer turns you as it moves, and
+resting it in the outer fifth of the picture keeps turning that way. Click the
+game to start; Esc stops.
 
 ## Controls
 
