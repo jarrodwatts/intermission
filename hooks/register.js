@@ -47,6 +47,8 @@ let isTurnRunning = false
 // Closed by hand during this turn, so stay out until the next one
 let isDismissed = false
 let isWelcomeOpen = false
+// Opened with /intermission play, so it stays open when Claude isn't working
+let isManual = false
 let timer = null
 let countdown = 0
 
@@ -155,6 +157,7 @@ async function goAway($) {
   cancelTimer()
   phase = 'idle'
   isWelcomeOpen = false
+  isManual = false
   frame = null
   // The next input region counts its clicks from zero again
   clientLine = '0'
@@ -429,7 +432,7 @@ export function register(on) {
     await $.command.register({
       name: 'intermission',
       description: 'Play Doom while Claude works',
-      argumentHint: '[off]',
+      argumentHint: '[play|off]',
     })
     return next(e)
   })
@@ -444,6 +447,19 @@ export function register(on) {
     }
     isOn = true
     await $.store.set('isOn', true)
+    if (e.args.trim() === 'play') {
+      // Play now, working or not; the pane stays until you close it
+      if (phase === 'idle' || phase === 'waiting' || phase === 'offered') {
+        cancelTimer()
+        isWelcomeOpen = false
+        isManual = true
+        const { isPlaced } = await $.ui.open({ id: PANE, title: 'intermission', focus: true })
+        if (isPlaced) await startPlaying($)
+        else isManual = false
+      }
+      void ensureEngine($)
+      return {}
+    }
     // Opening it yourself also lets it open by itself in narrower terminals
     if (phase === 'idle') {
       isWelcomeOpen = true
@@ -477,7 +493,7 @@ export function register(on) {
       withdrawOffer($)
     } else if (phase === 'playing') {
       if (e.isAborted) await pullOut($)
-      else startCountdown($)
+      else if (!isManual) startCountdown($)
     }
     return next(e)
   })
@@ -547,7 +563,7 @@ export function register(on) {
             ],
           }),
           ...(downloadStatus ? [Text({ children: [downloadStatus] })] : []),
-          Text({ dimColor: true, children: ['/intermission off turns it off.'] }),
+          Text({ dimColor: true, children: ['/intermission play plays now, even when Claude is idle. /intermission off turns it off.'] }),
           Button({
             key: 'got-it',
             label: 'Got it',
